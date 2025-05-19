@@ -36,11 +36,11 @@ struct Features {
 // ---------------------------------------------------------------------------
 // Precision helper
 // ---------------------------------------------------------------------------
-static inline CufftPrecision to_enum(const char *txt)
-{
-    if (txt && std::strcmp(txt, "single") == 0)  return CUFFT_PREC_SINGLE;
-    if (txt && std::strcmp(txt, "half")   == 0)  return CUFFT_PREC_HALF;
-    return CUFFT_PREC_DOUBLE;                     // default / “double”
+static inline WrFFTPrecision parse_precision(const char* txt) {
+    if (txt && std::strcmp(txt,"single") == 0) return WRFFT_PREC_SINGLE;
+    if (txt && std::strcmp(txt,"double") == 0) return WRFFT_PREC_DOUBLE;
+    if (txt && std::strcmp(txt,"half") == 0)   return WRFFT_PREC_HALF;
+    return WRFFT_PREC_DOUBLE; // default
 }
 
 #ifndef CUDA_CHECK
@@ -88,17 +88,17 @@ Features extract_features(const ComplexData* data, size_t nx, size_t ny) {
     idx.resize(std::min(n, SAMPLE_SIZE));
 
     double sum_r=0, sum_i=0;
-    for (auto i: idx) { sum_r += data[i].real; sum_i += data[i].imag; }
+    for (auto i: idx) { sum_r += data[i].x; sum_i += data[i].y; }
     double mean_r = sum_r/idx.size();
     double mean_i = sum_i/idx.size();
 
     double var_r=0, var_i=0, mag=0;
     for (auto i: idx) {
-        double dr = data[i].real - mean_r;
-        double di = data[i].imag - mean_i;
+        double dr = data[i].x - mean_r;
+        double di = data[i].y - mean_i;
         var_r += dr*dr;
         var_i += di*di;
-        mag   += std::hypot(data[i].real, data[i].imag);
+        mag   += std::hypot(data[i].x, data[i].y);
     }
     var_r /= idx.size();
     var_i /= idx.size();
@@ -270,113 +270,101 @@ WrFFTErrors wrfft_classify(ComplexData* data, WrFFTConfig* cfg) {
     return WRFFT_SUCCESS;
 }
 
-WrFFTErrors wrfft_plan(ComplexData* data, WrFFTConfig* cfg) {
-    if (!data || !cfg) return WRFFT_ERROR_INVALID_INPUT;
+WrFFTErrors wrfft_plan(WrFFTConfig* cfg) {
+    if (!cfg) return WRFFT_ERROR_INVALID_INPUT;
     int nx = (int)cfg->data_size[0];
     int ny = (int)cfg->data_size[1];
     int n  = nx * ny;
     WrFFTErrors err = WRFFT_SUCCESS;
-    const CufftPrecision prec = to_enum(cfg->chosen_precision);
+    const WrFFTPrecision prec = parse_precision(cfg->chosen_precision);
     if (cfg->data_size[2] == 1) {
         // 1D
-        Cufft1DContext* ctx = nullptr;
-        err = cufft1d_plan(nx, &ctx, prec);
-        if (err != WRFFT_SUCCESS) return err;
-        cfg->internal_plan = ctx;
-        cfg->gpu_input      = ctx->d_input;
+        if (strcmp(cfg->chosen_library, "cufft") == 0){
+            Cufft1DContext* ctx = nullptr;
+            err = cufft1d_plan(nx, &ctx, prec);
+            if (err != WRFFT_SUCCESS) return err;
+            cfg->internal_plan = ctx;
+        }
+        else if (strcmp(cfg->chosen_library, "cufftdx") == 0){
+            Cufftdx1DContext* ctx = nullptr;
+            err = cufftdx1d_plan(nx, &ctx, prec);
+            if (err != WRFFT_SUCCESS) return err;
+            cfg->internal_plan = ctx;
+        }
+        else if (strcmp(cfg->chosen_library, "vkfft") == 0){
+            Vkfft1DContext* ctx = nullptr;
+            err = vkfft1d_initialize(&ctx);
+            if (err != WRFFT_SUCCESS) return err;
+            err = vkfft1d_plan(nx, ctx, prec);
+            if (err != WRFFT_SUCCESS) return err;
+            cfg->internal_plan = ctx;
+        } else {
+            std::cerr << "ERROR: unknown library '" << cfg->chosen_library << "'\n";
+            return WRFFT_ERROR_MODEL_FAILURE;
+        }
     } else {
         // 2D
-        Cufft2DContext* ctx = nullptr;
-        err = cufft2d_plan(nx, ny, &ctx, prec);
-        if (err != WRFFT_SUCCESS) return err;
-        cfg->internal_plan = ctx;
-        cfg->gpu_input      = ctx->d_input;
+        if (strcmp(cfg->chosen_library, "cufft") == 0){
+            Cufft2DContext* ctx = nullptr;
+            err = cufft2d_plan(nx, ny, &ctx, prec);
+            if (err != WRFFT_SUCCESS) return err;
+            cfg->internal_plan = ctx;
+        }
+        else if (strcmp(cfg->chosen_library, "cufftdx") == 0){
+            Cufftdx2DContext* ctx = nullptr;
+            err = cufftdx2d_plan(nx, ny, &ctx, prec);
+            if (err != WRFFT_SUCCESS) return err;
+            cfg->internal_plan = ctx;
+        }
+        else if (strcmp(cfg->chosen_library, "vkfft") == 0){
+            Vkfft2DContext* ctx = nullptr;
+            err = vkfft2d_initialize(&ctx);
+            if (err != WRFFT_SUCCESS) return err;
+            err = vkfft2d_plan(nx, ny, ctx, prec);
+            if (err != WRFFT_SUCCESS) return err;
+            cfg->internal_plan = ctx;
+        } else {
+            std::cerr << "ERROR: unknown library '" << cfg->chosen_library << "'\n";
+            return WRFFT_ERROR_MODEL_FAILURE;
+        }
     }
     if (err != WRFFT_SUCCESS) return err;
-
-    /* 2. Copy & convert host input -> device buffer */
-    size_t bytes = (prec == CUFFT_PREC_SINGLE) ? sizeof(cufftComplex)      * n :
-                   (prec == CUFFT_PREC_DOUBLE) ? sizeof(cufftDoubleComplex)* n :
-                                                 sizeof(half2)             * n;
-
-    switch (prec)
-    {
-        case CUFFT_PREC_SINGLE: {
-            std::vector<cufftComplex> h(n);
-            for (int i = 0; i < n; ++i) {
-                h[i].x = static_cast<float>(data[i].real);
-                h[i].y = static_cast<float>(data[i].imag);
-            }
-            CUDA_CHECK(cudaMemcpy(cfg->gpu_input, h.data(), bytes, cudaMemcpyHostToDevice));
-            break;
-        }
-        case CUFFT_PREC_DOUBLE: {
-            CUDA_CHECK(cudaMemcpy(cfg->gpu_input, data, bytes, cudaMemcpyHostToDevice));
-            break;
-        }
-        case CUFFT_PREC_HALF: {
-            std::vector<half2> h(n);
-            for (int i = 0; i < n; ++i) {
-                h[i].x = __double2half(data[i].real);
-                h[i].y = __double2half(data[i].imag);
-            }
-            CUDA_CHECK(cudaMemcpy(cfg->gpu_input, h.data(), bytes, cudaMemcpyHostToDevice));
-            break;
-        }
-    }
     return WRFFT_SUCCESS;
 }
 
-WrFFTErrors wrfft_execute(ComplexData* out, WrFFTConfig* cfg) {
-    if (!out || !cfg || !cfg->internal_plan) return WRFFT_ERROR_INVALID_INPUT;
+WrFFTErrors wrfft_execute(ComplexData* data, WrFFTConfig* cfg) {
+    if (!data || !cfg || !cfg->internal_plan) return WRFFT_ERROR_INVALID_INPUT;
     // Cufft1DContext* ctx = static_cast<Cufft1DContext*>(cfg->internal_plan);
     WrFFTErrors err = WRFFT_SUCCESS;
-    const CufftPrecision prec = to_enum(cfg->chosen_precision);
+    const WrFFTPrecision prec = parse_precision(cfg->chosen_precision);
     if (cfg->data_size[2] == 1) {
-        Cufft1DContext* ctx = static_cast<Cufft1DContext*>(cfg->internal_plan);
-        err = cufft1d_execute(ctx, CUFFT_FORWARD);
-        cfg->gpu_output = ctx->d_output;
+        if (strcmp(cfg->chosen_library, "cufft") == 0) {
+            Cufft1DContext* ctx = static_cast<Cufft1DContext*>(cfg->internal_plan);
+            err = cufft1d_execute(ctx, data, CUFFT_FORWARD);
+        } else if (strcmp(cfg->chosen_library, "cufftdx") == 0) {
+            Cufftdx1DContext* ctx = static_cast<Cufftdx1DContext*>(cfg->internal_plan);
+            err = cufftdx1d_execute(ctx, data);
+        } else if (strcmp(cfg->chosen_library, "vkfft") == 0) {
+            Vkfft1DContext* ctx = static_cast<Vkfft1DContext*>(cfg->internal_plan);
+            err = vkfft1d_execute(ctx, data);
+        }
     } else {
-        Cufft2DContext* ctx = static_cast<Cufft2DContext*>(cfg->internal_plan);
-        err = cufft2d_execute(ctx, CUFFT_FORWARD);
-        cfg->gpu_output = ctx->d_output;
+        if (strcmp(cfg->chosen_library, "cufft") == 0) {
+            Cufft2DContext* ctx = static_cast<Cufft2DContext*>(cfg->internal_plan);
+            err = cufft2d_execute(ctx, data, CUFFT_FORWARD);
+        } else if (strcmp(cfg->chosen_library, "cufftdx") == 0) {
+            Cufftdx2DContext* ctx = static_cast<Cufftdx2DContext*>(cfg->internal_plan);
+            err = cufftdx2d_execute(ctx, data);
+        } else if (strcmp(cfg->chosen_library, "vkfft") == 0) {
+            Vkfft2DContext* ctx = static_cast<Vkfft2DContext*>(cfg->internal_plan);
+            err = vkfft2d_execute(ctx, data);
+        }
     }
     if (err != WRFFT_SUCCESS) {
         std::cerr << "  execute failed: " << err << "\n";
-        (cfg->data_size[2] == 1) ? cufft1d_cleanup(static_cast<Cufft1DContext*>(cfg->internal_plan)) : cufft2d_cleanup(static_cast<Cufft2DContext*>(cfg->internal_plan));
+        wrfft_finalize(cfg);
     }
 
-    /* 2. Copy & convert device -> out                                         */
-    const int n     = cfg->data_size[0] * cfg->data_size[1];
-    size_t    bytes = (prec == CUFFT_PREC_SINGLE) ? sizeof(cufftComplex)      * n :
-                      (prec == CUFFT_PREC_DOUBLE) ? sizeof(cufftDoubleComplex)* n :
-                                                    sizeof(half2)             * n;
-
-    switch (prec)
-    {
-        case CUFFT_PREC_SINGLE: {
-            std::vector<cufftComplex> h(n);
-            CUDA_CHECK(cudaMemcpy(h.data(), cfg->gpu_output, bytes, cudaMemcpyDeviceToHost));
-            for (int i = 0; i < n; ++i) {
-                out[i].real = h[i].x;
-                out[i].imag = h[i].y;
-            }
-            break;
-        }
-        case CUFFT_PREC_DOUBLE: {
-            CUDA_CHECK(cudaMemcpy(out, cfg->gpu_output, bytes, cudaMemcpyDeviceToHost));
-            break;
-        }
-        case CUFFT_PREC_HALF: {
-            std::vector<half2> h(n);
-            CUDA_CHECK(cudaMemcpy(h.data(), cfg->gpu_output, bytes, cudaMemcpyDeviceToHost));
-            for (int i = 0; i < n; ++i) {
-                out[i].real = static_cast<double>(h[i].x);
-                out[i].imag = static_cast<double>(h[i].y);
-            }
-            break;
-        }
-    }
     return WRFFT_SUCCESS;
 }
 
@@ -385,11 +373,33 @@ WrFFTErrors wrfft_finalize(WrFFTConfig* cfg) {
 
     WrFFTErrors err;
     if (cfg->data_size[2] == 1) {
-        Cufft1DContext* ctx = static_cast<Cufft1DContext*>(cfg->internal_plan);
-        err = cufft1d_cleanup(ctx);
+        // 1D
+        if (strcmp(cfg->chosen_library, "cufft") == 0) {
+          err = cufft1d_cleanup(static_cast<Cufft1DContext*>(cfg->internal_plan));
+        }
+        else if (strcmp(cfg->chosen_library, "cufftdx") == 0) {
+          err = cufftdx1d_cleanup(static_cast<Cufftdx1DContext*>(cfg->internal_plan));
+        }
+        else if (strcmp(cfg->chosen_library, "vkfft") == 0) {
+          err = vkfft1d_cleanup(static_cast<Vkfft1DContext*>(cfg->internal_plan));
+        }
+        else {
+          return WRFFT_ERROR_INVALID_INPUT;
+        }
     } else {
-        Cufft2DContext* ctx = static_cast<Cufft2DContext*>(cfg->internal_plan);
-        err = cufft2d_cleanup(ctx);
+        // 2D
+        if (strcmp(cfg->chosen_library, "cufft") == 0) {
+          err = cufft2d_cleanup(static_cast<Cufft2DContext*>(cfg->internal_plan));
+        }
+        else if (strcmp(cfg->chosen_library, "cufftdx") == 0) {
+          err = cufftdx2d_cleanup(static_cast<Cufftdx2DContext*>(cfg->internal_plan));
+        }
+        else if (strcmp(cfg->chosen_library, "vkfft") == 0) {
+          err = vkfft2d_cleanup(static_cast<Vkfft2DContext*>(cfg->internal_plan));
+        }
+        else {
+          return WRFFT_ERROR_INVALID_INPUT;
+        }
     }
 
     cfg->internal_plan = nullptr;

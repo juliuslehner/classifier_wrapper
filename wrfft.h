@@ -3,9 +3,12 @@
 
 #include <stddef.h>   // for size_t
 #include "wrfft_common.h"
-#include "cufft_wrapper/cufft_common.h"
-#include "cufft_wrapper/cufft_wrapper_1d.h"
-#include "cufft_wrapper/cufft_wrapper_2d.h"
+#include "backends/cufft/cufft_wrapper_1d.h"
+#include "backends/cufft/cufft_wrapper_2d.h"
+#include "backends/vkfft/vkfft_wrapper_1d.h"
+#include "backends/vkfft/vkfft_wrapper_2d.h"
+#include "backends/cufftdx/cufftdx_wrapper_1d.hpp"
+#include "backends/cufftdx/cufftdx_wrapper_2d.hpp"
 
 // Library version
 #define WRFFT_VERSION "1.0.0"
@@ -15,12 +18,6 @@ typedef enum {
     OPTIMIZE_SPEED,          // Optimize for speed
     OPTIMIZE_ENERGY          // Optimize for energy efficiency
 } WrFFTOptimizationCriteria;
-
-// Basic complex data type for the API.
-typedef struct {
-    double real;
-    double imag;
-} ComplexData;
 
 
 // Main configuration structure for FFT operations.
@@ -73,22 +70,21 @@ WrFFTErrors wrfft_classify(ComplexData *input_data, WrFFTConfig *config);
  * This function allocates necessary resources and prepares a plan for execution.
  * The plan is stored in the WrFFT configuration structure.
  *
- * @param input_data Pointer to the input complex data.
  * @param config     Pointer to the WrFFT configuration. Must have been updated by wrfft_classify().
  * @return WrFFTErrors WRFFT_SUCCESS if plan creation succeeds, or an appropriate error code otherwise.
  */
-WrFFTErrors wrfft_plan(ComplexData *input_data, WrFFTConfig *config);
+WrFFTErrors wrfft_plan( WrFFTConfig *config);
 
 /**
  * @brief Executes the FFT using the selected and planned FFT library.
  * 
- * The output is stored in the provided output data array.
+ * The output is stored in the provided data array that holds the input data.
  *
- * @param output_data Pointer to an array where the FFT output will be stored.
+ * @param data        Pointer to an array where the FFT input/output is stored.
  * @param config      Pointer to the WrFFT configuration.
  * @return WrFFTErrors WRFFT_SUCCESS if the FFT execution succeeds, or an appropriate error code otherwise.
  */
-WrFFTErrors wrfft_execute(ComplexData *output_data, WrFFTConfig *config);
+WrFFTErrors wrfft_execute(ComplexData *data, WrFFTConfig *config);
 
 /**
  * @brief Finalizes the FFT operations and cleans up all allocated resources.
